@@ -2,10 +2,14 @@ services:
   - type: web
     name: church-app-backend
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: SUPABASE_URL
-        value: https://your-project.supabase.co
+        sync: false
       - key: SUPABASE_SERVICE_KEY
-        value: your-service-role-key
+        sync: false
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
