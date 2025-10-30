@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: church-app-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: SUPABASE_URL
+        value: https://your-project.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        value: your-service-role-key
