@@ -1,14 +1,11 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import fitz  # PyMuPDF for PDF
 from docx import Document  # python-docx for DOCX
-import textract  # textract for DOC
 import io
 import os
 from supabase import create_client, Client
-from typing import Optional
 import logging
 from datetime import datetime
 
@@ -16,20 +13,8 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Church App Text Extraction API",
-    description="Extract text from PDF, DOCX, DOC, and TXT files",
-    version="1.0.0"
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)
 
 # Supabase setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -45,18 +30,6 @@ else:
     except Exception as e:
         logger.error(f"Failed to initialize Supabase: {e}")
         supabase = None
-
-class FileRequest(BaseModel):
-    file_url: HttpUrl
-    song_id: Optional[str] = None
-
-class ExtractionResponse(BaseModel):
-    text: str
-    status: str
-    file_type: str
-    updated_supabase: bool
-    char_count: int
-    timestamp: str
 
 def extract_text_from_pdf(file_content: bytes) -> str:
     """Extract text from PDF using PyMuPDF"""
@@ -75,7 +48,7 @@ def extract_text_from_pdf(file_content: bytes) -> str:
         return text.strip()
     except Exception as e:
         logger.error(f"PDF extraction error: {e}")
-        raise HTTPException(status_code=400, detail=f"PDF extraction failed: {str(e)}")
+        raise Exception(f"PDF extraction failed: {str(e)}")
 
 def extract_text_from_docx(file_content: bytes) -> str:
     """Extract text from DOCX using python-docx"""
@@ -99,32 +72,7 @@ def extract_text_from_docx(file_content: bytes) -> str:
         return text.strip()
     except Exception as e:
         logger.error(f"DOCX extraction error: {e}")
-        raise HTTPException(status_code=400, detail=f"DOCX extraction failed: {str(e)}")
-
-def extract_text_from_doc(file_content: bytes) -> str:
-    """Extract text from DOC using textract"""
-    temp_file = None
-    try:
-        # Save to temp file for textract
-        temp_file = f"/tmp/temp_doc_{os.getpid()}.doc"
-        with open(temp_file, "wb") as f:
-            f.write(file_content)
-        
-        text = textract.process(temp_file).decode('utf-8')
-        
-        if not text.strip():
-            raise ValueError("No text found in DOC file.")
-        
-        return text.strip()
-    except Exception as e:
-        logger.error(f"DOC extraction error: {e}")
-        raise HTTPException(status_code=400, detail=f"DOC extraction failed: {str(e)}")
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except:
-                pass
+        raise Exception(f"DOCX extraction failed: {str(e)}")
 
 def extract_text_from_txt(file_content: bytes) -> str:
     """Extract text from TXT file with multiple encoding attempts"""
@@ -138,13 +86,13 @@ def extract_text_from_txt(file_content: bytes) -> str:
         except (UnicodeDecodeError, AttributeError):
             continue
     
-    raise HTTPException(status_code=400, detail="Failed to decode text file with supported encodings")
+    raise Exception("Failed to decode text file with supported encodings")
 
-async def update_supabase_record(song_id: str, text: str):
-    """Background task to update Supabase"""
+def update_supabase_record(song_id: str, text: str):
+    """Update Supabase record"""
     if not supabase:
         logger.warning("Supabase not configured, skipping database update")
-        return
+        return False
     
     try:
         result = supabase.table('song_scripts').update({
@@ -154,31 +102,37 @@ async def update_supabase_record(song_id: str, text: str):
         
         if result.data:
             logger.info(f"Successfully updated song_id: {song_id}")
+            return True
         else:
             logger.warning(f"No record found for song_id: {song_id}")
+            return False
     except Exception as e:
         logger.error(f"Supabase update error: {e}")
+        return False
 
-@app.post("/extract-text", response_model=ExtractionResponse)
-async def extract_text(request: FileRequest, background_tasks: BackgroundTasks):
-    """
-    Extract text from uploaded file and optionally update Supabase
-    
-    Supported formats: PDF, DOCX, DOC, TXT
-    """
+@app.route('/extract-text', methods=['POST'])
+def extract_text():
+    """Extract text from uploaded file and optionally update Supabase"""
     try:
-        logger.info(f"Processing file: {request.file_url}")
+        data = request.get_json()
+        if not data or 'file_url' not in data:
+            return jsonify({'error': 'file_url is required'}), 400
+        
+        file_url = data['file_url']
+        song_id = data.get('song_id')
+        
+        logger.info(f"Processing file: {file_url}")
         
         # Download file from URL
-        response = requests.get(str(request.file_url), timeout=60)
+        response = requests.get(file_url, timeout=60)
         response.raise_for_status()
         file_content = response.content
         
         if not file_content:
-            raise HTTPException(status_code=400, detail="Downloaded file is empty")
+            return jsonify({'error': 'Downloaded file is empty'}), 400
         
         # Determine file type and extract text
-        file_url_lower = str(request.file_url).lower()
+        file_url_lower = file_url.lower()
         
         if file_url_lower.endswith('.pdf'):
             text = extract_text_from_pdf(file_content)
@@ -186,74 +140,60 @@ async def extract_text(request: FileRequest, background_tasks: BackgroundTasks):
         elif file_url_lower.endswith('.docx'):
             text = extract_text_from_docx(file_content)
             file_type = "docx"
-        elif file_url_lower.endswith('.doc'):
-            text = extract_text_from_doc(file_content)
-            file_type = "doc"
         elif file_url_lower.endswith('.txt'):
             text = extract_text_from_txt(file_content)
             file_type = "txt"
         else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type. Supported formats: PDF, DOCX, DOC, TXT"
-            )
+            return jsonify({
+                'error': 'Unsupported file type. Supported formats: PDF, DOCX, TXT'
+            }), 400
         
-        # Schedule Supabase update in background if song_id provided
+        # Update Supabase if song_id provided
         updated_supabase = False
-        if request.song_id and supabase:
-            background_tasks.add_task(update_supabase_record, request.song_id, text)
-            updated_supabase = True
+        if song_id and supabase:
+            updated_supabase = update_supabase_record(song_id, text)
         
         logger.info(f"Successfully extracted {len(text)} characters from {file_type}")
         
-        return ExtractionResponse(
-            text=text,
-            status="success",
-            file_type=file_type,
-            updated_supabase=updated_supabase,
-            char_count=len(text),
-            timestamp=datetime.utcnow().isoformat()
-        )
+        return jsonify({
+            'text': text,
+            'status': 'success',
+            'file_type': file_type,
+            'updated_supabase': updated_supabase,
+            'char_count': len(text),
+            'timestamp': datetime.utcnow().isoformat()
+        })
         
     except requests.RequestException as e:
         logger.error(f"File download error: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
-    except HTTPException:
-        raise
+        return jsonify({'error': f'Failed to download file: {str(e)}'}), 400
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+        return jsonify({'error': f'Extraction failed: {str(e)}'}), 500
 
-@app.get("/")
-async def root():
-    return {
+@app.route('/')
+def root():
+    return jsonify({
         "service": "Church App Text Extraction API",
         "version": "1.0.0",
         "status": "operational",
-        "supported_formats": ["PDF", "DOCX", "DOC", "TXT"],
+        "supported_formats": ["PDF", "DOCX", "TXT"],
         "endpoints": {
             "POST /extract-text": "Extract text from file URL",
             "GET /health": "Health check endpoint"
-        },
-        "docs": "/docs"
-    }
+        }
+    })
 
-@app.get("/health")
-async def health_check():
+@app.route('/health')
+def health_check():
     """Health check endpoint for monitoring"""
     supabase_status = "connected" if supabase else "disabled"
-    return {
+    return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "supabase": supabase_status
-    }
+    })
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    app.run(host="0.0.0.0", port=port, debug=False)
